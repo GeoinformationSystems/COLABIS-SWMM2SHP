@@ -3,13 +3,11 @@ package de.dresden.tu;
 import com.univocity.parsers.fixed.FixedWidthFields;
 import com.univocity.parsers.fixed.FixedWidthParser;
 import com.univocity.parsers.fixed.FixedWidthParserSettings;
-import com.vividsolutions.jts.geom.Coordinate;
-import com.vividsolutions.jts.geom.GeometryFactory;
-import com.vividsolutions.jts.geom.LineString;
-import com.vividsolutions.jts.geom.Point;
+import com.vividsolutions.jts.geom.*;
 import de.dresden.tu.swmm.Conduit;
 import de.dresden.tu.swmm.Junction;
 import de.dresden.tu.swmm.Outfall;
+import de.dresden.tu.swmm.Subcatchment;
 import org.geotools.data.DataUtilities;
 import org.geotools.data.DefaultTransaction;
 import org.geotools.data.Transaction;
@@ -40,19 +38,23 @@ public class SWMM2SHP {
     private final static String CONDUITS = "CONDUITS";
     private final static String OUTFALLS = "OUTFALLS";
     private final static String JUNCTIONS = "JUNCTIONS";
+    private final static String SUBCATCHMENTS = "SUBCATCHMENTS";
+    private final static String POLYGONS = "Polygons";
 
     private final static String START = "_START";
     private final static String END = "_END";
 
-    private Map<String, Integer> marks = new HashMap<String, Integer>();
-    private Map<String, int[]> lengths = new HashMap<String, int[]>();
+    private Map<String, Integer> marks = new HashMap<>();
+    private Map<String, int[]> lengths = new HashMap<>();
 
-    private Map<String, Coordinate> coordinates = new HashMap<String, Coordinate>();
-    private Map<String, Conduit> conduits = new HashMap<String, Conduit>();
-    private Map<String, Outfall> outfalls = new HashMap<String, Outfall>();
-    private Map<String, Junction> junctions = new HashMap<String, Junction>();
+    private Map<String, Coordinate> coordinates = new HashMap<>();
+    private Map<String, Conduit> conduits = new HashMap<>();
+    private Map<String, Outfall> outfalls = new HashMap<>();
+    private Map<String, Junction> junctions = new HashMap<>();
+    private Map<String, ArrayList<Coordinate>> polygons = new HashMap<>();
+    private Map<String, Subcatchment> subcatchments = new HashMap<>();
 
-    private ArrayList<String> inpFileArray = new ArrayList<String>();
+    private ArrayList<String> inpFileArray = new ArrayList<>();
 
     private GeometryFactory geometryFactory;
     private String folderlocation;
@@ -61,6 +63,7 @@ public class SWMM2SHP {
     private final SimpleFeatureType JUNCTION_POINT_TYPE = DataUtilities.createType("Junction", "the_geom:Point,name:String,elevation:Double,maxDepth:Double,initDepth:Double,surDepth:Double,aponded:Boolean");
     private final SimpleFeatureType OUTFALL_POINT_TYPE = DataUtilities.createType("Outfall", "the_geom:Point,name:String,elevation:Double,type:String,stageData:String,gated:Boolean,routeTo:String");
     private final SimpleFeatureType CONDUIT_POLYLINE_TYPE = DataUtilities.createType("Conduit", "the_geom:LineString,name:String,fromNode:String,toNode:String,length:Double,roughness:Double,inOffset:Double,outOffset:Double,initFlow:Double,maxFlow:Double,shape:String,geom1:Double,geom2:Double,geom3:Double,geom4:Double");
+    private final SimpleFeatureType SUBCATCHMENT_POLYGON_TYPE = DataUtilities.createType("Subcatchment", "the_geom:Polygon,name:String,rain_gage:String,outlet:String,area:Double,percentImperv:Double,width:Double,percentSlope:Double,curbLen:Double");
 
     public static void main(String[] args) throws Exception {
         SWMM2SHP swmm2shp = new SWMM2SHP();
@@ -110,6 +113,12 @@ public class SWMM2SHP {
                 } else if (line.startsWith("[" + JUNCTIONS + "]")) {
                     marks.put(JUNCTIONS + START, i + 2);
                     current = JUNCTIONS;
+                } else if (line.startsWith("[" + SUBCATCHMENTS + "]")){
+                    marks.put(SUBCATCHMENTS + START, i + 2);
+                    current = SUBCATCHMENTS;
+                } else if (line.startsWith("[" + POLYGONS + "]")){
+                    marks.put(POLYGONS + START, i + 2);
+                    current = POLYGONS;
                 } else if (line.trim().length() == 0 && current != null) {
                     marks.put(current + END, i - 2);
                     current = null;
@@ -136,11 +145,15 @@ public class SWMM2SHP {
             readOutfalls();
             readConduits();
 
+            readPolygons();
+            readSubcatchments();
+
             geometryFactory = JTSFactoryFinder.getGeometryFactory(null);
 
             createJunctionsFeature();
             createOufallsFeature();
             createConduitFeature();
+            createSubcatchmentFeature();
 
         } catch (FileNotFoundException e) {
             e.printStackTrace();
@@ -154,8 +167,38 @@ public class SWMM2SHP {
         return true;
     }
 
+    private void createSubcatchmentFeature() throws IOException {
+        SimpleFeatureBuilder featureBuilder = new SimpleFeatureBuilder(SUBCATCHMENT_POLYGON_TYPE);
+        Iterator subcatchmentIterator = subcatchments.entrySet().iterator();
+        DefaultFeatureCollection collection = new DefaultFeatureCollection();
+        while (subcatchmentIterator.hasNext()) {
+            Map.Entry pair = (Map.Entry) subcatchmentIterator.next();
+            ArrayList<Coordinate> polygonList = polygons.get(pair.getKey());
+            polygonList.add(polygonList.get(0));
+            Coordinate[] polygonCoordinates = polygonList.toArray(new Coordinate[polygonList.size()]);
+            Polygon p = geometryFactory.createPolygon(polygonCoordinates);
+            featureBuilder.add(p);
+            featureBuilder.add(pair.getKey());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getRain_gage());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getOutlet());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getArea());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getPercentImperv());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getWidth());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getPercentSlope());
+            featureBuilder.add(((Subcatchment) pair.getValue()).getCurbLen());
+            SimpleFeature feature = featureBuilder.buildFeature(null);
+            collection.add(feature);
+        }
+
+        File newFile = new File(folderlocation + "\\subcatchments.shp");
+        ShapefileDataStoreFactory dataStoreFactory = new ShapefileDataStoreFactory();
+        Map<String, Serializable> params = new HashMap<String, Serializable>();
+        params.put("url", newFile.toURI().toURL());
+        params.put("create spatial index", Boolean.TRUE);
+        writeToShape(collection, dataStoreFactory, params, SUBCATCHMENT_POLYGON_TYPE);
+    }
+
     private void createConduitFeature() throws IOException {
-//        private final SimpleFeatureType CONDUIT_POLYLINE_TYPE = DataUtilities.createType("Conduit", "the_geom:Polyline,name:String,fromNode:String,toNode:String,length:Double,roughness:Double,inOffset:Double,outOffset:Double,initFlow:Double,maxFlow:Double,shape:String,geom1:Double,geom2:Double,geom3:Double,geom4:Double");
         SimpleFeatureBuilder featureBuilder = new SimpleFeatureBuilder(CONDUIT_POLYLINE_TYPE);
         Iterator conduitIterator = conduits.entrySet().iterator();
         DefaultFeatureCollection collection = new DefaultFeatureCollection();
@@ -316,7 +359,6 @@ public class SWMM2SHP {
     }
 
     private void readConduits() {
-
         FixedWidthFields fwf = new FixedWidthFields(lengths.get(CONDUITS));
         FixedWidthParserSettings settings = new FixedWidthParserSettings(fwf);
         settings.setRecordEndsOnNewline(true);
@@ -329,7 +371,7 @@ public class SWMM2SHP {
             conduits.put(thisline[0], conduit);
         }
 
-        fwf = new FixedWidthFields(lengths.get(OUTFALLS));
+        fwf = new FixedWidthFields(lengths.get(XSECTIONS));
         settings = new FixedWidthParserSettings(fwf);
         settings.setRecordEndsOnNewline(true);
         settings.setSkipTrailingCharsUntilNewline(true);
@@ -346,6 +388,38 @@ public class SWMM2SHP {
             conduits.put(thisline[0], conduit);
         }
     }
+
+    private void readPolygons() {
+        FixedWidthFields fwf = new FixedWidthFields(lengths.get(POLYGONS));
+        FixedWidthParserSettings settings = new FixedWidthParserSettings(fwf);
+        settings.setRecordEndsOnNewline(true);
+        settings.setSkipTrailingCharsUntilNewline(true);
+        FixedWidthParser parser = new FixedWidthParser(settings);
+
+        for (int i = marks.get(POLYGONS + START); i <= marks.get(POLYGONS + END); i++) {
+            String[] thisline = parser.parseLine(inpFileArray.get(i));
+            ArrayList<Coordinate> polygonCoordinates = (polygons.get(thisline[0]) == null)? new ArrayList<>(): polygons.get(thisline[0]);
+            double latitude = Double.parseDouble(thisline[2]);
+            double longitude = Double.parseDouble(thisline[1]);
+            polygonCoordinates.add(new Coordinate(longitude, latitude));
+            polygons.put(thisline[0], polygonCoordinates);
+        }
+    }
+
+    private void readSubcatchments(){
+        FixedWidthFields fwf = new FixedWidthFields(lengths.get(SUBCATCHMENTS));
+        FixedWidthParserSettings settings = new FixedWidthParserSettings(fwf);
+        settings.setRecordEndsOnNewline(true);
+        settings.setSkipTrailingCharsUntilNewline(true);
+        FixedWidthParser parser = new FixedWidthParser(settings);
+
+        for (int i = marks.get(SUBCATCHMENTS + START); i <= marks.get(SUBCATCHMENTS + END); i++) {
+            String[] thisline = parser.parseLine(inpFileArray.get(i));
+            Subcatchment subcatchment = new Subcatchment(thisline[0], thisline[1], thisline[2], Double.parseDouble(thisline[3]), Double.parseDouble(thisline[4]), Double.parseDouble(thisline[5]), Double.parseDouble(thisline[6]), Double.parseDouble(thisline[7]));
+            subcatchments.put(thisline[0], subcatchment);
+        }
+    }
+
 
     public static File getINPFile(File inpFile) {
         JFileChooser chooser = new JFileChooser("inp");
